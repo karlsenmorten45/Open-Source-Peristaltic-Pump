@@ -156,5 +156,414 @@ void setup() {
   menu[6].lim = 2;
   menu[6].options[0] = "Dose";
   menu[6].options[1] = "Pump";
-  menu[6].options[2] = "Cal
-
+  menu[6].options[2] = "Cal.";
+
+  menu[7].name_ = "Cal.";
+  menu[7].type = VALUE;
+  menu[7].value = 0;
+  menu[7].decimals = CALIBR_DECIMALS;
+  menu[7].lim = 20000;
+  menu[7].suffix = "mL";
+
+  menu[8].name_ = "Save Sett.";
+  menu[8].type = ACTION;
+  menu[8].value = 0;
+  menu[8].lim = 0;
+  menu[8].suffix = "OK!";
+
+  menu[9].name_ = "USB Ctrl";
+  menu[9].type = ACTION;
+  menu[9].value = 0;
+  menu[9].lim = 0;
+  menu[9].suffix = "ON!";
+
+  // Load settings from EEPROM
+  for (int i = 0; i <= menu_items_limit; i++) {
+    menu[i].value = eepromReadInt(i * 2);
+  }
+
+  encoder = new ClickEncoder(ENCODER_PIN_B, ENCODER_PIN_A, ENCODER_PIN_BUTTON, 4);
+  encoder->setAccelerationEnabled(false);
+  Timer1.initialize(ENCODER_TIMER_INTERVAL_US);
+  Timer1.attachInterrupt(timerIsr);
+  last = 0;
+
+  Serial.begin(BAUD);
+  inputString.reserve(SERIAL_INPUT_BUFFER_SIZE);
+
+  lcd.begin(LCD_COLUMNS, LCD_ROWS);
+
+  menu[1].suffix = menu[2].options[menu[2].value];
+  menu[3].suffix = menu[4].options[menu[4].value];
+  if (strcmp(menu[1].suffix, "uL") == 0) menu[1].decimals = 0; else menu[1].decimals = 1;
+  if (strcmp(menu[3].suffix, "uL/min") == 0) menu[3].decimals = 0; else menu[3].decimals = 1;
+  update_lcd();
+
+  // Stepper library setup
+  stepper.setMaxSpeed(1000); // adjust as needed
+  stepper.setAcceleration(10000); // adjust as needed
+  stepper.setCurrentPosition(0);
+
+  setStepperDir(menu[5].value); // Set initial direction
+}
+
+void loop() {
+  // BUTTON HANDLING ////////////////////////////////////////////////////////////////////////////////
+  ClickEncoder::Button b = encoder->getButton();
+  if (b != ClickEncoder::Open) {
+    switch (b) {
+      case ClickEncoder::Clicked:
+        if (menu[menu_number_1].type == VALUE || menu[menu_number_1].type == OPTION) {
+          in_menu = !in_menu;
+        }
+        if (menu[menu_number_1].type == ACTION) {
+          in_action = !in_action;
+          if (in_action) stepperActive = false;
+        }
+        if (in_action == true || in_menu == true) {
+          menu_entered = true;
+        }
+        if (in_action == false && in_menu == false) {
+          menu_left = true;
+        }
+        break;
+      case ClickEncoder::DoubleClicked:
+        if (menu[menu_number_1].type == VALUE) {
+          menu[menu_number_1].value = menu[menu_number_1].value + menu[menu_number_1].lim / 10;
+          val_change = true;
+        }
+        break;
+      case ClickEncoder::Held:
+        if (menu[menu_number_1].type == VALUE) {
+          menu[menu_number_1].value = 0;
+          val_change = true;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (menu_entered) {
+    lcd.blink();
+    if (menu[menu_number_1].type == ACTION) {
+      lcd.setCursor((LCD_COLUMNS - strlen(menu[menu_number_1].suffix)), 0);
+      lcd.print(menu[menu_number_1].suffix);
+      lcd.setCursor(15, 0);
+    }
+    if (menu[menu_number_1].type == VALUE) {
+      encoder->setAccelerationEnabled(true);
+    }
+    menu_entered = false;
+  }
+
+  // ACTIONS ////////////////////////////////////////////////////////////////////////////////
+  if (in_action) {
+    switch (menu_number_1) {
+      case 0: // Start
+        if (!stepperActive) {
+          // Dose, Pump, or Cal. - start stepper
+          if (menu[6].value == 0) { // Dose
+            target_steps = steps_calc(menu[1].value, menu[2].value, menu[7].value, menu[1].decimals);
+            startStepper(target_steps);
+          } else if (menu[6].value == 1) { // Pump (Continuous)
+            stepper.setSpeed(stepsPerSecond(menu[3].value, menu[4].value, menu[7].value, menu[3].decimals));
+            stepper.move(1L << 30); // move "forever"
+            stepperActive = true;
+          } else if (menu[6].value == 2) { // Cal.
+            startStepper(CALIBR_STEPS);
+          }
+        }
+        stepper.run(); // non-blocking, always call in loop
+        // Check for dose/cal completion
+        if (stepperActive && (menu[6].value == 0 || menu[6].value == 2) && stepper.distanceToGo() == 0) {
+          stepperActive = false;
+          exit_action_menu();
+        }
+        break;
+
+      case 8: // Save settings
+        for (int i = 0; i <= menu_items_limit; i++) {
+          eepromWriteInt(i * 2, menu[i].value);
+        }
+        delay(SAVE_CONFIRM_DELAY_MS);
+        menu_left = true;
+        break;
+
+      case 9: // USB Ctrl (Serial)
+        handleUSB();
+        break;
+    }
+  } else { // MENU (no action)
+    if (val_change) {
+      unsigned long currentTime = millis();
+      if (currentTime - lastLcdUpdateTime > lcdUpdateInterval) {
+        update_lcd();
+        lastLcdUpdateTime = currentTime;
+      }
+      val_change = false;
+    }
+    value += encoder->getValue();
+    if (!in_menu) {
+      val_change = encoder_selection(menu_number_1, menu_number_2, menu_items_limit);
+    } else if (in_menu) {
+      if (menu[menu_number_1].type == 0) {
+        val_change = encoder_value_selection(menu[menu_number_1].value, menu[menu_number_1].lim);
+      } else {
+        val_change = encoder_selection(menu[menu_number_1].value, menu[menu_number_1].lim);
+      }
+    }
+  }
+
+  if (menu_left) {
+    lcd.noBlink();
+    if (menu[menu_number_1].type == ACTION) {
+      exit_action_menu();
+    }
+    if (menu[menu_number_1].type == VALUE) {
+      encoder->setAccelerationEnabled(false);
+    }
+    if (menu_number_1 == 2) {
+      menu[1].suffix = menu[2].options[menu[2].value];
+      if (strcmp(menu[1].suffix, "uL") == 0) menu[1].decimals = 0; else menu[1].decimals = 1;
+    }
+    if (menu_number_1 == 4) {
+      menu[3].suffix = menu[4].options[menu[4].value];
+      if (strcmp(menu[3].suffix, "uL/min") == 0) menu[3].decimals = 0; else menu[3].decimals = 1;
+    }
+    if (menu_number_1 == 5) {
+      setStepperDir(menu[5].value);
+    }
+    menu_left = false;
+  }
+  // Always call stepper.run() in loop for non-blocking movement
+  if (stepperActive) stepper.run();
+}
+
+// ---- Helper Functions ----
+
+void timerIsr() {
+  encoder->service();
+}
+
+// Start a new stepper move (dose or calibration)
+void startStepper(long steps) {
+  stepper.setSpeed(stepsPerSecond(menu[3].value, menu[4].value, menu[7].value, menu[3].decimals));
+  stepper.move(steps);
+  stepperActive = true;
+}
+
+// Set direction based on menu
+void setStepperDir(int dir) {
+  if (dir == 0) stepper.setDirectionCW();
+  else stepper.setDirectionCCW();
+}
+
+// USB/Serial command handler (non-blocking)
+void handleUSB() {
+  static char currentUsbCommand = 0;
+  static long usb_steps = 0;
+  static long usb_speed = 0;
+  static int usb_cal_value = 0;
+
+  char receivedChar;
+  while (Serial.available()) {
+    receivedChar = (char)Serial.read();
+    usb_start = true;
+
+    if (receivedChar == 'p') {
+      currentUsbCommand = 'p';
+      usb_speed = Serial.parseInt();
+      usb_cal_value = Serial.parseInt();
+      if (usb_cal_value == 0) usb_cal_value = menu[7].value;
+      stepper.setSpeed(stepsPerSecond(usb_speed, 1, usb_cal_value, 0));
+      stepper.move(1L << 30); // "infinite"
+      stepperActive = true;
+    } else if (receivedChar == 'd') {
+      currentUsbCommand = 'd';
+      usb_steps = steps_calc(Serial.parseInt(), 1, Serial.parseInt(), 0);
+      stepper.setSpeed(stepsPerSecond(Serial.parseInt(), 1, usb_cal_value, 0));
+      stepper.move(usb_steps);
+      stepperActive = true;
+    } else if (receivedChar == 'c') {
+      currentUsbCommand = 'c';
+      stepper.setSpeed(stepsPerSecond(menu[3].value, menu[4].value, menu[7].value, menu[3].decimals));
+      stepper.move(CALIBR_STEPS);
+      stepperActive = true;
+    } else if (receivedChar == 'w') {
+      currentUsbCommand = 0;
+      usb_start = false;
+      int temp_cal = Serial.parseInt();
+      menu[7].value = temp_cal;
+      for (int i = 0; i <= menu_items_limit; i++) {
+        eepromWriteInt(i * 2, menu[i].value);
+      }
+    } else if (receivedChar == 'x') {
+      currentUsbCommand = 0;
+      usb_start = false;
+      stepper.stop();
+      stepperActive = false;
+    }
+  }
+  if (stepperActive) stepper.run();
+  if (stepperActive && stepper.distanceToGo() == 0 && (currentUsbCommand == 'd' || currentUsbCommand == 'c')) {
+    stepperActive = false;
+    currentUsbCommand = 0;
+  }
+}
+
+// Calculate steps for dosing
+long steps_calc(long volume_val, int unit_mode, int calibr_val, int vol_decimals) {
+  long _steps;
+  double actual_volume = (double)volume_val / powerOf10(vol_decimals);
+  double cal_mL_per_rot = (double)calibr_val / CALIBR_DECIMAL_CORR / CALIBR_ROTATIONS;
+
+  if (unit_mode == 2) { // rotations
+    _steps = (long)(STEPS_PER_FULL_ROT * STEP_MODE * actual_volume);
+    return _steps;
+  }
+  double volume_in_mL = (unit_mode == 1) ? actual_volume / 1000.0 : actual_volume;
+  if (cal_mL_per_rot == 0) return 0;
+  double rotations_needed = volume_in_mL / cal_mL_per_rot;
+  _steps = (long)(STEPS_PER_FULL_ROT * STEP_MODE * rotations_needed);
+  return _steps;
+}
+
+// Calculate steps per second for MultiStepperLite based on speed
+float stepsPerSecond(long speed_val, int speed_unit_mode, int calibr_val, int speed_decimals) {
+  double actual_speed = (double)speed_val / powerOf10(speed_decimals);
+  double cal_mL_per_rot = (double)calibr_val / CALIBR_DECIMAL_CORR / CALIBR_ROTATIONS;
+  double rotations_per_minute;
+
+  if (speed_unit_mode == 2) {
+    rotations_per_minute = actual_speed;
+  } else {
+    double volume_mL_per_minute = (speed_unit_mode == 1) ? actual_speed / 1000.0 : actual_speed;
+    if (cal_mL_per_rot == 0) return 1;
+    rotations_per_minute = volume_mL_per_minute / cal_mL_per_rot;
+  }
+  if (rotations_per_minute <= 0) return 1;
+  double steps_per_minute = STEPS_PER_FULL_ROT * STEP_MODE * rotations_per_minute;
+  return steps_per_minute / 60.0;
+}
+
+void exit_action_menu() {
+  in_action = false;
+  const char* suffix_to_clear = menu[menu_number_1].suffix;
+  int suffix_len = strlen(suffix_to_clear);
+  if (suffix_len > 0 && suffix_len < LCD_COLUMNS) {
+    lcd.setCursor((LCD_COLUMNS - suffix_len), 0);
+    for (int i = 0; i < suffix_len; ++i) {
+      lcd.print(" ");
+    }
+  }
+  lcd.noBlink();
+  stepper.stop();
+  stepperActive = false;
+}
+
+void update_lcd() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(menu_number_1);
+  lcd.print("|");
+  lcd.print(menu[menu_number_1].name_);
+  if (menu[menu_number_1].type == 0) {
+    value_dbl = menu[menu_number_1].value;
+    value_dbl = value_dbl / powerOf10(menu[menu_number_1].decimals);
+    dtostrf(value_dbl, VALUE_MAX_DIGITS, menu[menu_number_1].decimals, value_str );
+    lcd.print(" ");
+    lcd.print(value_str);
+    lcd.print(menu[menu_number_1].suffix);
+  } else if (menu[menu_number_1].type == 1) {
+    lcd.print(" ");
+    lcd.print(menu[menu_number_1].options[menu[menu_number_1].value]);
+  }
+  lcd.setCursor(0, 1);
+  lcd.print(menu_number_2);
+  lcd.print("|");
+  lcd.print(menu[menu_number_2].name_);
+  if (menu[menu_number_2].type == 0) {
+    value_dbl = menu[menu_number_2].value;
+    value_dbl = value_dbl / powerOf10(menu[menu_number_2].decimals);
+    dtostrf(value_dbl, VALUE_MAX_DIGITS, menu[menu_number_2].decimals, value_str );
+    lcd.print(" ");
+    lcd.print(value_str);
+    lcd.print(menu[menu_number_2].suffix);
+  } else if (menu[menu_number_2].type == 1) {
+    lcd.print(" ");
+    lcd.print(menu[menu_number_2].options[menu[menu_number_2].value]);
+  }
+  lcd.setCursor(1, 0);
+}
+
+bool encoder_selection(int & x, int lim) {
+  if (value > last) {
+    x++;
+    if (x > lim) x = 0;
+    last = value;
+    return true;
+  } else if (value < last) {
+    x--;
+    if (x < 0) x = lim;
+    last = value;
+    return true;
+  } else {
+    return false;
+  }
+}
+
+bool encoder_value_selection(int & x, int lim) {
+  if (value != last) {
+    x = x + value - last;
+    if (x > lim) x = 0;
+    if (x < 0) x = lim;
+    last = value;
+    return true;
+  } else {
+    return false;
+  }
+}
+
+bool encoder_selection(int & x, int & y, int lim) {
+  if (value > last) {
+    x++;
+    y++;
+    if (x > lim) x = 0;
+    if (y > lim) y = 0;
+    last = value;
+    return true;
+  } else if (value < last) {
+    y = menu_number_1;
+    x--;
+    if (x < 0) x = lim;
+    last = value;
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void eepromWriteInt(int adr, int wert) {
+  byte low, high;
+  low = wert & 0xFF;
+  high = (wert >> 8) & 0xFF;
+  EEPROM.write(adr, low);
+  EEPROM.write(adr + 1, high);
+}
+
+int eepromReadInt(int adr) {
+  byte low, high;
+  low = EEPROM.read(adr);
+  high = EEPROM.read(adr + 1);
+  return low + ((high << 8) & 0xFF00);
+}
+
+double powerOf10(int exp) {
+  double res = 1.0;
+  if (exp == 0) return 1.0;
+  bool is_negative = exp < 0;
+  if (is_negative) exp = -exp;
+  for (int i = 0; i < exp; ++i) res *= 10.0;
+  return is_negative ? (1.0 / res) : res;
+}
