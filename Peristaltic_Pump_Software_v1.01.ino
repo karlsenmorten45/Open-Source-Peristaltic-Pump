@@ -37,17 +37,19 @@ long step_counter = 0;
 #define CALIBR_ROTATIONS 30
 #define CALIBR_DURATION 30 // seconds
 #define CALIBR_DECIMALS 3
-const int CALIBR_DECIMAL_CORR = pow(10,CALIBR_DECIMALS);
+const int CALIBR_DECIMAL_CORR = pow(10,CALIBR_DECIMALS); // Calculated at compile/load time
 
 //SERIAL COMMUNICATION ---------------------------------------------------------------------
 #define BAUD 9600
+#define SERIAL_INPUT_BUFFER_SIZE 200
 String inputString = "";         // a String to hold incoming data
 boolean stringComplete = false;  // whether the string is complete
-long vol_uL=0;
-long rate_uL_min =0;
-int cal=0;
-boolean usb_start=0;
-char inChar;
+boolean usb_start=0; // Global flag for active USB-controlled motor action
+
+//TIMER AND DELAYS
+#define ENCODER_TIMER_INTERVAL_US 1000
+#define SAVE_CONFIRM_DELAY_MS 700
+#define MAX_MOTOR_STEP_DELAY_US 2000000L
 
 
 //STATE ------------------------------------------------------------------------------------
@@ -66,7 +68,7 @@ const unsigned int CALIBR_DELAY_US = (CALIBR_DURATION * MICROSEC_PER_SEC)/(CALIB
 //MENU ---------------------------------------------------------------------------------------
 #define MAX_NUM_OF_OPTIONS 4
 #define NUM_OF_MENU_ITEMS 10
-#define VALUE_MAX_DIGITS 4
+#define VALUE_MAX_DIGITS 7 // Increased to accommodate larger numbers like "20.000"
 int menu_number_1=0;
 int menu_number_2=1;
 boolean val_change =0;
@@ -180,27 +182,27 @@ void setup(){
   
   encoder = new ClickEncoder(ENCODER_PIN_B, ENCODER_PIN_A, ENCODER_PIN_BUTTON, 4); //(Encoder A, Encoder B, PushButton)
   encoder->setAccelerationEnabled(false);
-  Timer1.initialize(1000);
+  Timer1.initialize(ENCODER_TIMER_INTERVAL_US);
   Timer1.attachInterrupt(timerIsr);
   last = 0;
   
   Serial.begin(BAUD);
-  inputString.reserve(200);
+  inputString.reserve(SERIAL_INPUT_BUFFER_SIZE);
   // set up the LCD's number of columns and rows:
   lcd.begin(LCD_COLUMNS, LCD_ROWS);
   // Print a message to the LCD.
   menu[1].suffix = menu[2].options[menu[2].value];
-  if (menu[1].suffix=="uL"){
+  if (strcmp(menu[1].suffix, "uL") == 0){
     menu[1].decimals = 0;
   } else {
     menu[1].decimals = 1;
   }
-  if (menu[3].suffix=="uL/min"){
+  menu[3].suffix = menu[4].options[menu[4].value]; // Moved this line up to ensure suffix is set before comparison
+  if (strcmp(menu[3].suffix, "uL/min") == 0){
     menu[3].decimals = 0;
   } else {
     menu[3].decimals = 1;
   }
-  menu[3].suffix = menu[4].options[menu[4].value];
   update_lcd();
   steps = steps_calc(menu[1].value, menu[2].value, menu[7].value, menu[1].decimals);
   delay_us = delay_us_calc(menu[3].value, menu[4].value, menu[7].value, menu[3].decimals);
@@ -293,60 +295,86 @@ if (in_action){
    for (int i=0; i <= menu_items_limit; i++){
       eepromWriteInt(i*2,menu[i].value);
    }
-   delay(700);
+   delay(SAVE_CONFIRM_DELAY_MS);
    menu_left = true;
   break;
   
-  case 9:
-  while (Serial.available()) {
-    inChar = (char)Serial.read();     // get the new byte:
-    step_counter = 0;
-    if (inChar == 'p'){
-      rate_uL_min=Serial.parseInt();
-      cal=Serial.parseInt();
-      if(cal==0){
-        cal = menu[7].value;
+  case 9: // USB Control
+    { // New scope for local variables
+      static char currentUsbCommand = 0; // Persists across loop iterations for this case
+      static long usb_vol_uL = 0;
+      static long usb_rate_uL_min = 0;
+      static int usb_cal_value = 0;
+      static long usb_steps = 0;
+      static long usb_delay_us = 0;
+
+      char receivedChar; // Temporary for reading serial
+
+      while (Serial.available()) {
+        receivedChar = (char)Serial.read();
+        step_counter = 0; // Reset step counter on any new command char
+        usb_start = true; // Assume a command will start, can be overridden by 'x' or 'w'
+
+        if (receivedChar == 'p') {
+          currentUsbCommand = 'p';
+          usb_rate_uL_min = Serial.parseInt();
+          usb_cal_value = Serial.parseInt();
+          if (usb_cal_value == 0) {
+            usb_cal_value = menu[7].value;
+          }
+          usb_delay_us = delay_us_calc(usb_rate_uL_min, 1 /*uL/min mode*/, usb_cal_value, 0 /*decimals*/);
+        } else if (receivedChar == 'd') {
+          currentUsbCommand = 'd';
+          usb_vol_uL = Serial.parseInt();
+          usb_rate_uL_min = Serial.parseInt();
+          usb_cal_value = Serial.parseInt();
+          if (usb_cal_value == 0) {
+            usb_cal_value = menu[7].value;
+          }
+          usb_steps = steps_calc(usb_vol_uL, 1 /*uL mode*/, usb_cal_value, 0 /*decimals*/);
+          usb_delay_us = delay_us_calc(usb_rate_uL_min, 1 /*uL/min mode*/, usb_cal_value, 0 /*decimals*/);
+        } else if (receivedChar == 'c') {
+          currentUsbCommand = 'c';
+          // Uses CALIBR_STEPS, CALIBR_DELAY_US directly, no params needed from serial
+        } else if (receivedChar == 'w') {
+          currentUsbCommand = 0; // Not an action command
+          usb_start = false;
+          int temp_cal = Serial.parseInt();
+          menu[7].value = temp_cal;
+          for (int i = 0; i <= menu_items_limit; i++) {
+            eepromWriteInt(i * 2, menu[i].value);
+          }
+        } else if (receivedChar == 'x') {
+          currentUsbCommand = 0;
+          usb_start = false;
+        } else {
+          // Potentially an unknown character or just a delimiter (like newline)
+          // If it's not a command character, we might not want to set usb_start = true
+          // For now, the logic implies any serial char could start some processing if not 'w' or 'x'
+          // This might need refinement if delimiters cause issues.
+           if (currentUsbCommand == 0) usb_start = false; // If no active command, don't start on random char
+        }
       }
-      delay_us = delay_us_calc(rate_uL_min, 1, cal, 0);
-      usb_start=true;
-    } else if (inChar == 'd'){
-      vol_uL=Serial.parseInt();
-      rate_uL_min=Serial.parseInt();
-      cal=Serial.parseInt();
-      if(cal==0){
-        cal = menu[7].value;
+
+      if (usb_start && currentUsbCommand != 0) {
+        if (currentUsbCommand == 'p') {
+          pump(usb_delay_us);
+        } else if (currentUsbCommand == 'd') {
+          if (dose(usb_steps, usb_delay_us, step_counter)) {
+            usb_start = false;
+            currentUsbCommand = 0;
+          }
+        } else if (currentUsbCommand == 'c') {
+          if (dose(CALIBR_STEPS, CALIBR_DELAY_US, step_counter)) {
+            usb_start = false;
+            currentUsbCommand = 0;
+          }
+        }
+      } else if (!usb_start) { // Ensure command is cleared if usb_start became false
+          currentUsbCommand = 0;
       }
-      steps = steps_calc(vol_uL, 1, cal, 0);
-      delay_us = delay_us_calc(rate_uL_min, 1, cal, 0);
-      usb_start=true;
-    } else if (inChar == 'c'){
-      usb_start=true;
-    } else if (inChar == 'w'){
-      cal=Serial.parseInt();
-      menu[7].value =cal;
-      for (int i=0; i <= menu_items_limit; i++){
-      eepromWriteInt(i*2,menu[i].value);
-      }
-      usb_start=false;
-    } else if (inChar == 'x'){
-      usb_start=false;
-    }
-  }
-  
-  if (usb_start) {
-    if(inChar == 'p'){
-      pump(delay_us);
-    } else if (inChar == 'd') {
-      if (dose(steps, delay_us, step_counter)){
-        usb_start = false;
-      }
-    } else if (inChar == 'c'){
-      if (dose(CALIBR_STEPS, CALIBR_DELAY_US, step_counter)){
-        usb_start = false;
-      }
-    }
-  }
-  break;
+    } // End scope for USB local variables
+    break;
 }
 
 /// MENU (no action) ////////////////////////////////////////////////////////////////////////////////
@@ -388,18 +416,18 @@ if (menu_left){
     encoder->setAccelerationEnabled(false);
   }
   
-  if (menu_number_1 == 2){
-    menu[menu_number_1-1].suffix = menu[menu_number_1].options[menu[menu_number_1].value];
-      if (menu[1].suffix=="uL"){
+  if (menu_number_1 == 2){ // V.Unit changed
+    menu[1].suffix = menu[2].options[menu[2].value]; // Update Volume suffix
+      if (strcmp(menu[1].suffix, "uL") == 0){
         menu[1].decimals = 0;
       } else {
         menu[1].decimals = 1;
        }
   }
 
-  if (menu_number_1 == 4){
-    menu[menu_number_1-1].suffix = menu[menu_number_1].options[menu[menu_number_1].value];
-    if (menu[3].suffix=="uL/min"){
+  if (menu_number_1 == 4){ // S.Unit changed
+    menu[3].suffix = menu[4].options[menu[4].value]; // Update Speed suffix
+    if (strcmp(menu[3].suffix, "uL/min") == 0){
       menu[3].decimals = 0;
     } else {
       menu[3].decimals = 1;
@@ -469,63 +497,103 @@ void pump(int _delay_us) {
 
 void exit_action_menu(){
    in_action = false;
-   lcd.setCursor((LCD_COLUMNS - strlen(menu[menu_number_1].suffix)), 0);
-   lcd.print("          ");
+   // Clear the suffix previously printed for the action
+   const char* suffix_to_clear = menu[menu_number_1].suffix;
+   int suffix_len = strlen(suffix_to_clear);
+   if (suffix_len > 0 && suffix_len < LCD_COLUMNS) { // Basic sanity check for length
+       lcd.setCursor((LCD_COLUMNS - suffix_len), 0);
+       for (int i = 0; i < suffix_len; ++i) {
+           lcd.print(" ");
+       }
+   }
    lcd.noBlink();
 }
 //_____________________________________________________________________________________________
 
-long steps_calc(long volume, int unit_mode, int calibr, int decimals){ 
-//unit_mode = menu[2].value, volume = menu[1].value, calib = mL/10rot
-  
-long _steps;
-int decimal_corr;
-double conv; // rotations/volume
-double cal; //volume/rotation
+long steps_calc(long volume_val, int unit_mode, int calibr_val, int vol_decimals) {
+  long _steps;
+  double actual_volume = (double)volume_val / powerOf10(vol_decimals);
 
-decimal_corr = pow(10,decimals);
-cal = calibr;
-cal = (cal/CALIBR_ROTATIONS)/CALIBR_DECIMAL_CORR;
+  // cal_mL_per_rot: Calibration factor in mL per one full rotation of the motor.
+  // calibr_val is the EEPROM stored value, e.g., 15000 for 15.000 mL per CALIBR_ROTATIONS.
+  // CALIBR_DECIMAL_CORR is pow(10, CALIBR_DECIMALS), e.g., 1000.
+  double cal_mL_per_rot = (double)calibr_val / CALIBR_DECIMAL_CORR / CALIBR_ROTATIONS;
 
-  if(unit_mode == 2){ //rot
-    conv = 1.0;
-  } else if (unit_mode == 1){ //uL
-    conv = 1.0/cal/1000;
-  } else if (unit_mode == 0){ //mL
-    conv = 1.0/cal;
+  if (unit_mode == 2) { // Unit is 'rotations'
+    // actual_volume is interpreted directly as number of rotations.
+    _steps = (long)(STEPS_PER_FULL_ROT * STEP_MODE * actual_volume);
+    return _steps;
   }
 
-  _steps = STEPS_PER_FULL_ROT * STEP_MODE * conv * volume/decimal_corr;
-return _steps;
+  // For units mL or uL
+  double volume_in_mL;
+  if (unit_mode == 1) { // uL
+    volume_in_mL = actual_volume / 1000.0;
+  } else { // mL (unit_mode == 0)
+    volume_in_mL = actual_volume;
+  }
+
+  if (cal_mL_per_rot == 0) { // Avoid division by zero if calibration is invalid
+    return 0;
+  }
+
+  double rotations_needed = volume_in_mL / cal_mL_per_rot;
+  _steps = (long)(STEPS_PER_FULL_ROT * STEP_MODE * rotations_needed);
+  return _steps;
 }
 //_____________________________________________________________________________________________
 
-long delay_us_calc(long vol_per_min, int unit_mode, int calibr, int decimals){
-  
-double d_delay_us;
-long _delay_us;
-int decimal_corr;
-double conv; // rotations/volume
-double cal;  
+long delay_us_calc(long speed_val, int speed_unit_mode, int calibr_val, int speed_decimals) {
+  double actual_speed = (double)speed_val / powerOf10(speed_decimals); // e.g., mL/min, uL/min, or rpm
 
-decimal_corr = pow(10,decimals);
+  // cal_mL_per_rot: Same as in steps_calc
+  double cal_mL_per_rot = (double)calibr_val / CALIBR_DECIMAL_CORR / CALIBR_ROTATIONS;
 
-cal = calibr;
-cal = (cal/CALIBR_ROTATIONS)/CALIBR_DECIMAL_CORR;
+  double rotations_per_minute;
+  if (speed_unit_mode == 2) { // Unit is 'rpm' (rotations per minute)
+    rotations_per_minute = actual_speed;
+  } else { // Unit is volume/min (mL/min or uL/min)
+    double volume_mL_per_minute;
+    if (speed_unit_mode == 1) { // uL/min
+      volume_mL_per_minute = actual_speed / 1000.0;
+    } else { // mL/min (speed_unit_mode == 0)
+      volume_mL_per_minute = actual_speed;
+    }
 
-  if(unit_mode == 2){ //rot
-    conv = 1.0;
-  } else if (unit_mode == 1){ //uL
-    conv = 1.0/cal/1000;
-  } else if (unit_mode == 0){ //mL
-    conv = 1.0/cal;
+    if (cal_mL_per_rot == 0) { // Invalid calibration
+      return MAX_MOTOR_STEP_DELAY_US; // Return a very large delay (effectively zero speed)
+    }
+    rotations_per_minute = volume_mL_per_minute / cal_mL_per_rot;
   }
+
+  if (rotations_per_minute <= 0) { // Speed is zero or negative (invalid)
+    return MAX_MOTOR_STEP_DELAY_US; // Very large delay
+  }
+
+  double steps_per_minute = STEPS_PER_FULL_ROT * STEP_MODE * rotations_per_minute;
+  if (steps_per_minute <= 0) { // Should not happen if rotations_per_minute > 0
+      return MAX_MOTOR_STEP_DELAY_US;
+  }
+
+  double steps_per_second = steps_per_minute / 60.0;
   
-  d_delay_us = (1/(STEPS_PER_FULL_ROT * STEP_MODE * conv * vol_per_min/decimal_corr))*60*MICROSEC_PER_SEC/2;
-  _delay_us = d_delay_us;
+  // Each step has two phases (HIGH pulse, LOW pulse). Delay is for one phase.
+  // Total time per step = 2 * delay_us.
+  // Steps per second = 1 / (2 * delay_us_in_seconds)
+  // delay_us_in_seconds = 1 / (2 * steps_per_second)
+  // delay_us = (1.0 / (2.0 * steps_per_second)) * MICROSEC_PER_SEC;
+  double d_delay_us = MICROSEC_PER_SEC / (2.0 * steps_per_second);
+
+  long _delay_us = (long)d_delay_us;
+
+  if (_delay_us < 1) { // Practical minimum delay
+    _delay_us = 1;
+  }
+  // Max delay could also be capped if motor can't go arbitrarily slow due to holding torque etc.
+  // but 2,000,000 us (2 seconds per phase) is already very slow.
+
   return _delay_us;
 }
-
 //_____________________________________________________________________________________________
 
 void update_lcd(){
@@ -537,7 +605,7 @@ void update_lcd(){
   lcd.print(menu[menu_number_1].name_);
   if (menu[menu_number_1].type == 0){         //if value type
     value_dbl = menu[menu_number_1].value;
-    value_dbl = value_dbl/pow(10,menu[menu_number_1].decimals);
+    value_dbl = value_dbl/powerOf10(menu[menu_number_1].decimals);
     dtostrf(value_dbl, VALUE_MAX_DIGITS, menu[menu_number_1].decimals, value_str );
     lcd.print(" ");
     lcd.print(value_str); //print value
@@ -556,7 +624,7 @@ void update_lcd(){
   lcd.print(menu[menu_number_2].name_);
   if (menu[menu_number_2].type == 0){         //if value type
     value_dbl = menu[menu_number_2].value;
-    value_dbl = value_dbl/pow(10,menu[menu_number_2].decimals);
+    value_dbl = value_dbl/powerOf10(menu[menu_number_2].decimals);
     dtostrf(value_dbl, VALUE_MAX_DIGITS, menu[menu_number_2].decimals, value_str );
     lcd.print(" ");
     lcd.print(value_str); //print value
@@ -661,4 +729,19 @@ byte low, high;
   return low + ((high << 8)&0xFF00);
 } //eepromReadInt
 
+//_____________________________________________________________________________________________
+// Helper function to calculate powers of 10 for small integer exponents.
+// More efficient than float pow() for this specific case if used frequently.
+double powerOf10(int exp) {
+  double res = 1.0;
+  if (exp == 0) return 1.0; // Common case, quick return
 
+  boolean is_negative = exp < 0;
+  if (is_negative) exp = -exp; // Work with positive exponent
+
+  for (int i = 0; i < exp; ++i) {
+    res *= 10.0;
+  }
+
+  return is_negative ? (1.0 / res) : res;
+}
