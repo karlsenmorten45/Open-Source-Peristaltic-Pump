@@ -73,6 +73,9 @@ boolean val_change =0;
 double value_dbl;
 char value_str[VALUE_MAX_DIGITS+1];
 
+unsigned long lastLcdUpdateTime = 0;
+const unsigned long lcdUpdateInterval = 100; // milliseconds
+
 enum menu_type {
   VALUE,
   OPTION,
@@ -350,9 +353,13 @@ if (in_action){
 
 } else if (!in_action){
 
-if (val_change==true){
-  update_lcd();
-  val_change==false;
+if (val_change == true) {
+  unsigned long currentTime = millis();
+  if (currentTime - lastLcdUpdateTime > lcdUpdateInterval) {
+    update_lcd();
+    lastLcdUpdateTime = currentTime;
+  }
+  val_change = false; // Reset flag regardless of whether LCD updated
 }
   
 value += encoder->getValue(); // encoder update
