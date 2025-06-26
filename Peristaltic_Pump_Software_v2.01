@@ -1,0 +1,160 @@
+// Peristaltic Pump Controller
+// Stepper control now uses MultiStepperLite by @gunakkoc
+// https://github.com/gunakkoc/MultiStepperLite
+
+#include <LiquidCrystal.h>
+#include <ClickEncoder.h>
+#include <TimerOne.h>
+#include <EEPROM.h>
+#include <MultiStepperLite.h>
+
+// LCD -----------------------------------------------------------------------------------
+#define LCD_PIN_D4 8
+#define LCD_PIN_D5 9
+#define LCD_PIN_D6 10
+#define LCD_PIN_D7 11
+#define LCD_PIN_RS 13
+#define LCD_PIN_EN 12
+#define LCD_COLUMNS 16
+#define LCD_ROWS 2
+LiquidCrystal lcd(LCD_PIN_RS, LCD_PIN_EN, LCD_PIN_D4, LCD_PIN_D5, LCD_PIN_D6, LCD_PIN_D7);
+
+// ENCODER --------------------------------------------------------------------------------
+#define ENCODER_PIN_BUTTON 2
+#define ENCODER_PIN_A 3
+#define ENCODER_PIN_B 4
+ClickEncoder *encoder;
+int16_t last, value;
+
+// STEPPER MOTOR --------------------------------------------------------------------------
+#define MOTOR_STEP_PIN 7
+#define MOTOR_DIR_PIN 6
+#define STEP_MODE 4 // (1: Full Step, 2: Half Step, 4: Quarter Step, ...)
+#define STEPS_PER_FULL_ROT 200 // @ full steps
+
+// Use MultiStepperLite for stepper control
+MultiStepperLite stepper(MOTOR_STEP_PIN, MOTOR_DIR_PIN);
+
+long target_steps = 0;        // target steps for current operation
+bool stepperActive = false;   // true if a stepper operation is ongoing
+
+// CALIBRATION ----------------------------------------------------------------------------
+#define CALIBR_ROTATIONS 30
+#define CALIBR_DURATION 30 // seconds
+#define CALIBR_DECIMALS 3
+const int CALIBR_DECIMAL_CORR = 1000; // pow(10, CALIBR_DECIMALS)
+
+// SERIAL COMMUNICATION -------------------------------------------------------------------
+#define BAUD 9600
+#define SERIAL_INPUT_BUFFER_SIZE 200
+String inputString = "";
+boolean stringComplete = false;
+boolean usb_start = false;
+
+// TIMER AND DELAYS -----------------------------------------------------------------------
+#define ENCODER_TIMER_INTERVAL_US 1000
+#define SAVE_CONFIRM_DELAY_MS 700
+#define MAX_MOTOR_STEP_DELAY_US 2000000L
+
+// STATE ----------------------------------------------------------------------------------
+bool in_menu = false;
+volatile bool in_action = false;
+bool menu_entered = false;
+bool menu_left = false;
+
+// GENERAL --------------------------------------------------------------------------------
+#define MICROSEC_PER_SEC 1000000
+
+const unsigned int CALIBR_STEPS = CALIBR_ROTATIONS * STEPS_PER_FULL_ROT * STEP_MODE;
+
+// MENU -----------------------------------------------------------------------------------
+#define MAX_NUM_OF_OPTIONS 4
+#define NUM_OF_MENU_ITEMS 10
+#define VALUE_MAX_DIGITS 7
+int menu_number_1 = 0;
+int menu_number_2 = 1;
+bool val_change = false;
+double value_dbl;
+char value_str[VALUE_MAX_DIGITS + 1];
+
+unsigned long lastLcdUpdateTime = 0;
+const unsigned long lcdUpdateInterval = 100; // milliseconds
+
+enum menu_type {
+  VALUE,
+  OPTION,
+  ACTION
+};
+
+typedef struct
+{
+  const char* name_;
+  menu_type type;
+  int value;
+  int decimals;
+  int lim;
+  const char* options[4];
+  const char* suffix;
+} menu_item;
+
+int menu_items_limit = 9;
+menu_item menu[NUM_OF_MENU_ITEMS];
+
+void setup() {
+  pinMode(MOTOR_STEP_PIN, OUTPUT);
+  pinMode(MOTOR_DIR_PIN, OUTPUT);
+  digitalWrite(MOTOR_DIR_PIN, LOW);
+  digitalWrite(MOTOR_STEP_PIN, LOW);
+
+  // Menu setup
+  menu[0].name_ = "Start";
+  menu[0].type = ACTION;
+  menu[0].value = 0;
+  menu[0].lim = 0;
+  menu[0].suffix = "RUNNING!";
+
+  menu[1].name_ = "Volume";
+  menu[1].type = VALUE;
+  menu[1].value = 0;
+  menu[1].decimals = 1;
+  menu[1].lim = 9999;
+  menu[1].suffix = "mL";
+
+  menu[2].name_ = "V.Unit:";
+  menu[2].type = OPTION;
+  menu[2].value = 0;
+  menu[2].lim = 2;
+  menu[2].options[0] = "mL";
+  menu[2].options[1] = "uL";
+  menu[2].options[2] = "rot";
+
+  menu[3].name_ = "Speed";
+  menu[3].type = VALUE;
+  menu[3].value = 0;
+  menu[3].decimals = 1;
+  menu[3].lim = 999;
+  menu[3].suffix = "mL/min";
+
+  menu[4].name_ = "S.Unit:";
+  menu[4].type = OPTION;
+  menu[4].value = 0;
+  menu[4].lim = 2;
+  menu[4].options[0] = "mL/min";
+  menu[4].options[1] = "uL/min";
+  menu[4].options[2] = "rpm";
+
+  menu[5].name_ = "Direction:";
+  menu[5].type = OPTION;
+  menu[5].value = 0;
+  menu[5].lim = 1;
+  menu[5].options[0] = "CW";
+  menu[5].options[1] = "CCW";
+
+  menu[6].name_ = "Mode:";
+  menu[6].type = OPTION;
+  menu[6].value = 0;
+  menu[6].lim = 2;
+  menu[6].options[0] = "Dose";
+  menu[6].options[1] = "Pump";
+  menu[6].options[2] = "Cal
+
